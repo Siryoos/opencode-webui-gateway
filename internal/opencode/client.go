@@ -127,6 +127,12 @@ func (c *Client) SendMessage(ctx context.Context, sessionID string, req SendMess
 	return out, err
 }
 
+func (c *Client) ListMessages(ctx context.Context, sessionID string) ([]MessageResponse, error) {
+	var out []MessageResponse
+	err := c.do(ctx, http.MethodGet, "/session/"+sessionID+"/message", nil, &out)
+	return out, err
+}
+
 func (c *Client) PromptAsync(ctx context.Context, sessionID string, req SendMessageRequest) error {
 	return c.doStatus(ctx, http.MethodPost, "/session/"+sessionID+"/prompt_async", req, http.StatusNoContent)
 }

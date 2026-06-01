@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -16,7 +19,10 @@ import (
 	"github.com/adina/opencode-webui-gateway/internal/models"
 	"github.com/adina/opencode-webui-gateway/internal/openai"
 	"github.com/adina/opencode-webui-gateway/internal/opencode"
+	"github.com/adina/opencode-webui-gateway/internal/streaming"
 )
+
+const defaultStreamTimeout = 120 * time.Second
 
 type Server struct {
 	auth                auth.Validator
@@ -25,10 +31,12 @@ type Server struct {
 	ledger              *ledger.Ledger
 	logger              *slog.Logger
 	modelCreated        int64
+	streamLocks         *streaming.InFlightLocks
+	streamTimeout       time.Duration
 }
 
 func New(authv auth.Validator, requireHealth bool, oc *opencode.Client, led *ledger.Ledger, logger *slog.Logger) http.Handler {
-	s := &Server{auth: authv, requireAuthOnHealth: requireHealth, oc: oc, ledger: led, logger: logger, modelCreated: 1780324930}
+	s := &Server{auth: authv, requireAuthOnHealth: requireHealth, oc: oc, ledger: led, logger: logger, modelCreated: 1780324930, streamLocks: streaming.NewInFlightLocks(), streamTimeout: streamTimeout()}
 	r := chi.NewRouter()
 	r.Get("/health", s.health)
 	r.With(s.requireAuth).Get("/v1/models", s.models)
@@ -119,8 +127,15 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		s.writeDownstreamError(w, err)
 		return
 	}
+	reqBody := opencode.SendMessageRequest{Agent: route.Agent, System: system, Parts: []opencode.TextInput{{Type: "text", Text: latest}}}
+	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	created := time.Now().Unix()
+	if req.Stream != nil && *req.Stream {
+		s.streamChat(w, r, entry, req.Model, reqBody, id, created, includeUsage(req))
+		return
+	}
 
-	ocResp, err := s.oc.SendMessage(r.Context(), entry.OpenCodeSessionID, opencode.SendMessageRequest{Agent: route.Agent, System: system, Parts: []opencode.TextInput{{Type: "text", Text: latest}}})
+	ocResp, err := s.oc.SendMessage(r.Context(), entry.OpenCodeSessionID, reqBody)
 	if err != nil {
 		s.writeDownstreamError(w, err)
 		return
@@ -134,12 +149,6 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "gateway session ledger update failed", "server_error", nil, "opencode_bad_gateway")
 		return
 	}
-	id := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
-	created := time.Now().Unix()
-	if req.Stream != nil && *req.Stream {
-		s.writeSSE(w, id, created, req.Model, text)
-		return
-	}
 	writeJSON(w, http.StatusOK, openai.ChatCompletion{
 		ID:      id,
 		Object:  "chat.completion",
@@ -147,6 +156,123 @@ func (s *Server) chat(w http.ResponseWriter, r *http.Request) {
 		Model:   req.Model,
 		Choices: []openai.Choice{{Index: 0, Message: openai.AssistantResult{Role: "assistant", Content: text}, FinishReason: "stop"}},
 	})
+}
+
+func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, entry ledger.Entry, model string, req opencode.SendMessageRequest, id string, created int64, includeUsage bool) {
+	ctx, cancel := context.WithTimeout(r.Context(), s.streamTimeout)
+	defer cancel()
+	release, err := s.streamLocks.Acquire(ctx, entry.OpenCodeSessionID)
+	if err != nil {
+		if errors.Is(err, streaming.ErrSessionBusy) {
+			writeError(w, http.StatusConflict, "OpenCode session already has an active stream", "server_error", nil, "session_busy")
+			return
+		}
+		s.writeDownstreamError(w, err)
+		return
+	}
+	defer release()
+
+	stream, err := s.oc.SubscribeEvents(ctx)
+	if err != nil {
+		s.writeDownstreamError(w, err)
+		return
+	}
+	defer stream.Close()
+
+	mapper := streaming.NewMapper(entry.OpenCodeSessionID)
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			s.writeDownstreamError(w, err)
+			return
+		}
+		action := mapper.Handle(event)
+		if action.Kind == streaming.ActionConnected {
+			break
+		}
+		if action.Kind == streaming.ActionError {
+			s.writeDownstreamError(w, action.Err)
+			return
+		}
+	}
+
+	if err := s.oc.PromptAsync(ctx, entry.OpenCodeSessionID, req); err != nil {
+		s.writeDownstreamError(w, err)
+		return
+	}
+	mapper.MarkPromptSubmitted()
+
+	w.Header().Set("Connection", "keep-alive")
+	writer := openai.NewStreamWriter(w, id, created, model)
+	w.WriteHeader(http.StatusOK)
+	started := true
+	if err := writer.WriteRole(); err != nil {
+		s.logger.Error("stream role chunk write failed", "error", sanitizedError(err))
+		return
+	}
+	for {
+		event, err := stream.Next()
+		if err != nil {
+			s.finishStreamError(writer, started, err)
+			return
+		}
+		action := mapper.Handle(event)
+		switch action.Kind {
+		case streaming.ActionTextDelta, streaming.ActionProgress:
+			if err := writer.WriteTextDelta(action.Text); err != nil {
+				s.logger.Error("stream delta chunk write failed", "error", sanitizedError(err))
+				return
+			}
+		case streaming.ActionComplete:
+			if err := writer.WriteStop(); err != nil {
+				s.logger.Error("stream stop chunk write failed", "error", sanitizedError(err))
+				return
+			}
+			if includeUsage {
+				if usage, ok := s.fetchStreamUsage(ctx, entry.OpenCodeSessionID); ok {
+					if err := writer.WriteUsage(usage); err != nil {
+						s.logger.Error("stream usage chunk write failed", "error", sanitizedError(err))
+						return
+					}
+				}
+			}
+			if err := writer.WriteDone(); err != nil {
+				s.logger.Error("stream done write failed", "error", sanitizedError(err))
+				return
+			}
+			if err := s.ledger.Touch(context.Background(), entry.ID); err != nil {
+				s.logger.Error("failed to refresh ledger timestamp after stream", "ledger_id", entry.ID)
+			}
+			return
+		case streaming.ActionError:
+			s.finishStreamError(writer, started, action.Err)
+			return
+		}
+	}
+}
+
+func (s *Server) fetchStreamUsage(ctx context.Context, sessionID string) (openai.Usage, bool) {
+	messages, err := s.oc.ListMessages(ctx, sessionID)
+	if err != nil {
+		s.logger.Error("OpenCode final message fetch for usage failed", "error", sanitizedError(err))
+		return openai.Usage{}, false
+	}
+	for i := len(messages) - 1; i >= 0; i-- {
+		if usage, ok := openai.UsageFromOpenCodeTokens(messages[i].Info.Tokens); ok {
+			return usage, true
+		}
+	}
+	return openai.Usage{}, false
+}
+
+func (s *Server) finishStreamError(writer *openai.StreamWriter, started bool, err error) {
+	if !started {
+		return
+	}
+	s.logger.Error("OpenCode stream failed", "error", sanitizedError(err))
+	_ = writer.WriteTextDelta("\n\n_OpenCode streaming stopped before completion._\n\n")
+	_ = writer.WriteStop()
+	_ = writer.WriteDone()
 }
 
 func (s *Server) extractText(w http.ResponseWriter, ocResp opencode.MessageResponse) (string, bool) {
@@ -160,31 +286,6 @@ func (s *Server) extractText(w http.ResponseWriter, ocResp opencode.MessageRespo
 		return "", false
 	}
 	return text, true
-}
-
-func (s *Server) writeSSE(w http.ResponseWriter, id string, created int64, model string, content string) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.WriteHeader(http.StatusOK)
-	stop := "stop"
-	chunks := []openai.ChatCompletionChunk{
-		{ID: id, Object: "chat.completion.chunk", Created: created, Model: model, Choices: []openai.ChunkChoice{{Index: 0, Delta: map[string]any{"role": "assistant"}, FinishReason: nil}}},
-		{ID: id, Object: "chat.completion.chunk", Created: created, Model: model, Choices: []openai.ChunkChoice{{Index: 0, Delta: map[string]any{"content": content}, FinishReason: nil}}},
-		{ID: id, Object: "chat.completion.chunk", Created: created, Model: model, Choices: []openai.ChunkChoice{{Index: 0, Delta: map[string]any{}, FinishReason: &stop}}},
-	}
-	flusher, _ := w.(http.Flusher)
-	for _, chunk := range chunks {
-		data, _ := json.Marshal(chunk)
-		_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
-		if flusher != nil {
-			flusher.Flush()
-		}
-	}
-	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-	if flusher != nil {
-		flusher.Flush()
-	}
 }
 
 func (s *Server) writeDownstreamError(w http.ResponseWriter, err error) {
@@ -201,6 +302,51 @@ func (s *Server) writeDownstreamError(w http.ResponseWriter, err error) {
 		return
 	}
 	writeError(w, http.StatusBadGateway, "OpenCode returned an unusable response", "server_error", nil, "opencode_bad_gateway")
+}
+
+func streamTimeout() time.Duration {
+	value := os.Getenv("STREAM_TIMEOUT_SECONDS")
+	if value == "" {
+		return defaultStreamTimeout
+	}
+	seconds, err := strconv.Atoi(value)
+	if err != nil || seconds <= 0 {
+		return defaultStreamTimeout
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func includeUsage(req openai.ChatRequest) bool {
+	value, ok := req.StreamOptions["include_usage"]
+	if !ok {
+		return false
+	}
+	include, _ := value.(bool)
+	return include
+}
+
+func sanitizedError(err error) string {
+	if err == nil {
+		return ""
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return "context canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context deadline exceeded"
+	case errors.Is(err, opencode.ErrUnavailable):
+		return "opencode unavailable"
+	case errors.Is(err, opencode.ErrAuthFailed):
+		return "opencode auth failed"
+	case errors.Is(err, opencode.ErrBadGateway):
+		return "opencode bad gateway"
+	case errors.Is(err, opencode.ErrSSEMalformedJSON):
+		return "opencode malformed event json"
+	case errors.Is(err, io.EOF):
+		return "opencode event stream closed"
+	default:
+		return "internal stream error"
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, message, typ string, param *string, code string) {
