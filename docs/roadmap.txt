@@ -1,0 +1,140 @@
+This document outlines the technical roadmap and architecture specification for building an OpenAI-compatible gateway in front of OpenCode. It provides all architectural invariants, API translation requirements, and phased delivery goals without relying on source code.
+
+---
+
+## **1. Architectural Overview**
+
+The primary objective is to make OpenCode behave indistinguishably from natively integrated providers (like Hermes or OpenClaw) within Open WebUI. Open WebUI expects a standard OpenAI-compatible REST API. OpenCode provides a proprietary, stateful API designed for IDEs. The gateway serves as the translation and state-management layer bridging these two paradigms.
+
+### **Core Invariants**
+
+* **Primary Integration Path:** OpenAI-compatible Chat Completions endpoints.
+* **Avoided Abstractions:** Model Context Protocol (MCP) and Agent Context Protocol (ACP) are strictly secondary or client-side tools and will **not** be used for the gateway integration.
+* **State Management:** Open WebUI is stateless per request (sends full history). OpenCode is stateful (maintains internal sessions). The gateway **must** intercept the chat history, extract only the latest message, and route it to the correct persistent OpenCode session.
+
+### **Container Topography**
+
+For a local multi-container environment, the system requires three distinct nodes communicating over an internal network:
+
+1. **Client Node:** Open WebUI interface.
+2. **Gateway Node:** The translation layer (the application being specified).
+3. **Execution Node:** The headless OpenCode server container.
+
+---
+
+## **2. API Translation Contract**
+
+The gateway must implement a minimum viable surface area of the OpenAI specification and translate requests into OpenCode's endpoint structure.
+
+### **Required Gateway Endpoints**
+
+* `GET /health`: Internal gateway health and downstream OpenCode server verification.
+* `GET /v1/models`: Returns available OpenCode agents represented as standard models.
+* `POST /v1/chat/completions`: The core translation endpoint for receiving prompts and returning agent responses.
+
+### **Request Payload Mapping**
+
+When the gateway receives a Chat Completion request, it must execute the following field extractions and transformations:
+
+| Open WebUI (OpenAI Payload) | Gateway Action | OpenCode Translation |
+| --- | --- | --- |
+| **Model Selection** (`body.model`) | Lookup agent configuration | Mapped to specific OpenCode `agent` parameter (e.g., build, plan). |
+| **Messages Array** (`body.messages`) | Extract the system prompt and the *last* user message. Discard historical messages to prevent context duplication. | Mapped to the `system` property and `parts` array (as text-type parts). |
+| **Provider/Model Override** | Pass through to override OpenCode's default LLM if configured by the user. | Mapped to nested `providerID` and `modelID` properties. |
+
+### **Response Payload Mapping**
+
+OpenCode responds with structured parts (text, reasoning, tool execution, patches). The gateway must flatten this.
+
+* **Extraction Rule:** Concatenate all returned response parts where the part type equates to standard text. Ignore internal tool execution or patch parts unless formatting them as text-based progress updates.
+* **Packaging:** Wrap the extracted text in the standard OpenAI `chat.completion` response wrapper, injecting usage token counts provided by OpenCode's response metadata.
+
+---
+
+## **3. Session & State Management**
+
+This is the most critical technical mechanism. Forwarding the entire Open WebUI conversation transcript into an existing OpenCode session will break the agent's context window and duplicate history.
+
+### **The Session Ledger**
+
+The gateway must maintain an internal database (e.g., SQLite for MVP, Redis for distributed production) to map Open WebUI chat sessions to OpenCode backend sessions.
+
+**Ledger Schema Structure:**
+
+* **Primary Key:** Auto-incrementing identifier.
+* **User ID:** Extracted from HTTP headers.
+* **Chat ID:** Extracted from HTTP headers.
+* **Model ID:** Extracted from the request body.
+* **OpenCode Session ID:** The string returned by the OpenCode backend upon session creation.
+* **Timestamps:** Creation and last-updated records for garbage collection.
+
+### **Routing Logic Flow**
+
+1. Read user, chat, and model metadata from the incoming request.
+2. Query the Session Ledger using the composite key of (User ID + Chat ID + Model ID).
+3. If no record exists: Send a session creation request to the OpenCode backend, store the returned ID in the ledger.
+4. If a record exists: Retrieve the OpenCode Session ID.
+5. Dispatch *only* the newest user message to the specific OpenCode session endpoint.
+
+---
+
+## **4. Project Delivery Phases**
+
+### **Phase 1: The Minimum Viable Gateway (Non-Streaming)**
+
+* **Goal:** Establish basic connectivity and text response translation.
+* **Implementation:**
+* Implement the stateless API key authorization between Open WebUI and the Gateway.
+* Implement basic HTTP authentication from the Gateway to the OpenCode server.
+* Hardcode the model mapping router (exposing one analysis model and one execution model).
+* Implement synchronous request/response translation (no streaming).
+* Establish the Session Ledger for a single-user environment.
+
+
+
+### **Phase 2: Streaming and UX Polish**
+
+* **Goal:** Provide native-feeling, real-time token generation in the UI.
+* **Implementation:**
+* Map OpenCode's Server-Sent Events (SSE) stream to the OpenAI chunked streaming specification.
+* Implement an asynchronous pipeline: fire the prompt to OpenCode, immediately subscribe to the event stream, and yield token deltas back to Open WebUI.
+* Flatten internal tool progress events into markdown text chunks so the user sees what the agent is doing without Open WebUI needing to manage tool execution.
+
+
+
+### **Phase 3: Multi-Tenant Architecture**
+
+* **Goal:** Support multiple isolated users from a single Open WebUI instance.
+* **Implementation:**
+* Configure Open WebUI to forward user metadata headers.
+* Update the Session Ledger to strictly partition sessions by User ID.
+* Implement dynamic routing: instead of pointing all requests to one OpenCode server container, dynamically spawn or route to distinct OpenCode server instances based on the User ID.
+* Isolate file system mounts so each user has a dedicated workspace and home directory.
+
+
+
+### **Phase 4: Advanced Control Plane**
+
+* **Goal:** Production hardening and observability.
+* **Implementation:**
+* Map request cancellation from Open WebUI to OpenCode's session abort endpoints.
+* Implement idle-session garbage collection in the Session Ledger (e.g., terminating OpenCode sessions inactive for >30 minutes).
+* Add telemetry (metrics and trace correlation) to monitor upstream OpenCode performance.
+
+
+
+---
+
+## **5. Security and Permissions Specification**
+
+### **Authentication Tiers**
+
+1. **Public/Client Tier:** The gateway must be secured by a static bearer token configured in Open WebUI's connection settings.
+2. **Internal Tier:** The gateway communicates with the OpenCode server using basic authentication credentials injected via environment variables. These credentials must never be exposed to the Open WebUI client.
+
+### **Agent Capability Mapping**
+
+OpenCode supports granular permissions (read, write, bash, system access). The gateway should strictly delineate models based on these permissions to ensure safety.
+
+* **Analysis Model Profile:** Exposed to Open WebUI as a specific model name. Maps to an OpenCode agent configured with read-only file access. Shell access and external web fetches must be strictly denied in the configuration.
+* **Execution Model Profile:** Exposed as a separate model name. Maps to an OpenCode agent with write permissions. Destructive shell commands (removal, system-level execution, Docker manipulation) must be configured to an "ask" or "deny" state within the OpenCode backend configuration file to prevent catastrophic workspace damage.
