@@ -1,6 +1,6 @@
 # Phase 2 Streaming Live Verification
 
-Date: 2026-06-01
+Date: 2026-06-02
 
 Base URL: `http://127.0.0.1:4096`
 
